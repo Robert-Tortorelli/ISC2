@@ -1,0 +1,30 @@
+# Auto-detect text files and normalize line endings to LF on check-in
+* text=auto
+
+# C++ source files
+*.cpp text eol=crlf
+*.h   text eol=crlf
+*.hpp text eol=crlf
+
+# CMake
+CMakeLists.txt text eol=crlf
+*.cmake        text eol=crlf
+
+# Scripts
+*.ps1 text eol=crlf
+
+# Text/config files
+*.md       text eol=crlf
+*.json     text eol=crlf
+*.txt      text eol=crlf
+.gitignore text eol=crlf
+
+# Binary files — do not modify line endings
+*.docx binary
+*.pdf  binary
+*.exe  binary
+*.dll  binary
+*.lib  binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
