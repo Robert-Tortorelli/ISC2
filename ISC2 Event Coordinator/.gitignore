@@ -1,0 +1,7 @@
+build/
+tokens.json
+output/
+messages/
+
+# Chat transcripts
+*.md
