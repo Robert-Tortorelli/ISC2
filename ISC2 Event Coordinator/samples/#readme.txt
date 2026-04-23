@@ -1,0 +1,1 @@
+This folder is only used during development. It is not used at runtime.

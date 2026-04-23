@@ -3,6 +3,8 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <winhttp.h>
 #include <wincrypt.h>
@@ -99,6 +101,40 @@ static std::string parse_event_date(const std::string& name) {
     return "";
 }
 
+// Pre-fill the console input buffer so the user can edit a suggested value.
+// Injects key events into the Windows console input queue before std::getline
+// reads. Silently does nothing when stdin is not a real console handle.
+static void prefill_console_input(const std::string& text) {
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    if (hIn == INVALID_HANDLE_VALUE || hIn == nullptr) return;
+    DWORD mode = 0;
+    if (!GetConsoleMode(hIn, &mode)) return;  // Not a real console — skip
+    std::vector<INPUT_RECORD> records;
+    records.reserve(text.size() * 2);
+    for (unsigned char ch : text) {
+        SHORT vk = VkKeyScanA(static_cast<CHAR>(ch));
+        INPUT_RECORD ir = {};
+        ir.EventType = KEY_EVENT;
+        ir.Event.KeyEvent.wRepeatCount = 1;
+        ir.Event.KeyEvent.uChar.AsciiChar = static_cast<CHAR>(ch);
+        if (vk != -1) {
+            ir.Event.KeyEvent.wVirtualKeyCode = LOBYTE(vk);
+            ir.Event.KeyEvent.wVirtualScanCode =
+                static_cast<WORD>(MapVirtualKeyA(LOBYTE(vk), MAPVK_VK_TO_VSC));
+            BYTE hiVk = HIBYTE(vk);
+            if (hiVk & 1) ir.Event.KeyEvent.dwControlKeyState |= SHIFT_PRESSED;
+            if (hiVk & 2) ir.Event.KeyEvent.dwControlKeyState |= LEFT_CTRL_PRESSED;
+            if (hiVk & 4) ir.Event.KeyEvent.dwControlKeyState |= LEFT_ALT_PRESSED;
+        }
+        ir.Event.KeyEvent.bKeyDown = TRUE;
+        records.push_back(ir);
+        ir.Event.KeyEvent.bKeyDown = FALSE;
+        records.push_back(ir);
+    }
+    DWORD written = 0;
+    WriteConsoleInputA(hIn, records.data(), static_cast<DWORD>(records.size()), &written);
+}
+
 // ============================================================================
 // CSV Parser - handles quoted fields with commas and embedded quotes
 // ============================================================================
@@ -183,16 +219,19 @@ static fs::path g_token_file_path;
 static std::string g_exe_name;
 
 // Error log path (set from run() after base directory is determined)
-static fs::path g_errors_log_path;
+static fs::path g_error_log_path;
+
+// Security log path (set from run() after base directory is determined)
+static fs::path g_security_log_path;
 
 static void write_error_log(int error_num, const std::string& description, const std::string& detail) {
-    if (g_errors_log_path.empty()) return;
+    if (g_error_log_path.empty()) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
     char time_buf[32];
     snprintf(time_buf, sizeof(time_buf), "%04d-%02d-%02dT%02d:%02d:%02d",
              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    std::ofstream log(g_errors_log_path, std::ios::app);
+    std::ofstream log(g_error_log_path, std::ios::app);
     if (!log.is_open()) return;
     char nn[4];
     snprintf(nn, sizeof(nn), "%02d", error_num);
@@ -201,7 +240,27 @@ static void write_error_log(int error_num, const std::string& description, const
     else
         log << "Error" << nn << ": " << description << "\n";
     log << "Time: " << time_buf << "\n";
-    log << "Details:\n" << detail << "\n";
+    log << "Details: " << detail << "\n";
+    log << "\n";
+}
+
+static void write_security_log(int security_num, const std::string& description, const std::string& detail) {
+    if (g_security_log_path.empty()) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char time_buf[32];
+    snprintf(time_buf, sizeof(time_buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    std::ofstream log(g_security_log_path, std::ios::app);
+    if (!log.is_open()) return;
+    char nn[4];
+    snprintf(nn, sizeof(nn), "%02d", security_num);
+    if (description.empty())
+        log << "Security" << nn << ":\n";
+    else
+        log << "Security" << nn << ": " << description << "\n";
+    log << "Time: " << time_buf << "\n";
+    log << "Details: " << detail << "\n";
     log << "\n";
 }
 
@@ -272,11 +331,12 @@ static ConstantContactTokens load_tokens() {
 
 static bool refresh_access_token(ConstantContactTokens& tok) {
     if (tok.refresh_token.empty() || tok.api_key.empty() || tok.client_secret.empty()) {
-        std::cerr << "Cannot refresh token: missing";
-        if (tok.refresh_token.empty()) std::cerr << " refresh_token";
-        if (tok.client_secret.empty()) std::cerr << " client_secret";
-        if (tok.api_key.empty())       std::cerr << " api_key";
-        std::cerr << " in tokens.json\n";
+        std::string missing;
+        if (tok.refresh_token.empty()) missing += " refresh_token";
+        if (tok.client_secret.empty()) missing += " client_secret";
+        if (tok.api_key.empty())       missing += " api_key";
+        write_security_log(1, "Token refresh failed: missing credentials in tokens.json",
+            "Missing fields:" + missing);
         return false;
     }
     std::cout << "Access token expired. Refreshing...\n";
@@ -347,7 +407,8 @@ static bool refresh_access_token(ConstantContactTokens& tok) {
     WinHttpCloseHandle(hSession);
 
     if (response.empty()) {
-        std::cerr << "Token refresh failed: empty response.\n";
+        write_security_log(2, "Token refresh failed: empty response from authorization server",
+            "POST to authz.constantcontact.com/oauth2/default/v1/token returned an empty response.");
         return false;
     }
 
@@ -362,11 +423,14 @@ static bool refresh_access_token(ConstantContactTokens& tok) {
             std::cout << "Token refreshed successfully.\n";
             return true;
         } else {
-            std::cerr << "Token refresh error: " << response.substr(0, 300) << "\n";
+            write_security_log(3, "Token refresh error: server returned error response",
+                resp.value("error", resp.value("error_key", "unknown error")) + ": " +
+                resp.value("error_description", resp.value("error_message", "no description")));
             return false;
         }
     } catch (...) {
-        std::cerr << "Token refresh: failed to parse response.\n";
+        write_security_log(4, "Token refresh failed: could not parse authorization server response",
+            "Response could not be parsed as JSON.");
         return false;
     }
 }
@@ -413,8 +477,8 @@ static std::string http_get(const std::wstring& host, const std::wstring& path,
                             WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &sc_size,
                             WINHTTP_NO_HEADER_INDEX);
         if (status_code != 200) {
-            std::cerr << "  HTTP " << status_code << " from GET "
-                      << wide_to_utf8(path) << "\n";
+            write_security_log(5, "HTTP non-200 response from Constant Contact API",
+                "HTTP " + std::to_string(status_code) + " from GET " + wide_to_utf8(path));
         }
 
         DWORD size = 0;
@@ -502,18 +566,18 @@ static std::string csv_escape(const std::string& field) {
     return field;
 }
 
-static bool download_attendee_report(fs::path& output_csv_path,
+static bool download_attendee_report(fs::path& output_reg_spreadsheet_path,
                                      std::string& out_event_title,
                                      std::string& out_event_date) {
-    std::cout << "\n=== Step 1: Download Attendee Report from Constant Contact ===\n\n";
+    std::cout << "\n=== Step 1: Choose a Source of Constant Contact Event Registration Data ===\n\n";
 
 
-    // Determine the output directory: if output_csv_path is a directory, use it; if it's a file, use its parent
+    // Determine the output directory: if output_reg_spreadsheet_path is a directory, use it; if it's a file, use its parent
     fs::path output_dir;
-    if (fs::is_directory(output_csv_path)) {
-        output_dir = output_csv_path;
+    if (fs::is_directory(output_reg_spreadsheet_path)) {
+        output_dir = output_reg_spreadsheet_path;
     } else {
-        output_dir = output_csv_path.parent_path();
+        output_dir = output_reg_spreadsheet_path.parent_path();
     }
 
     std::vector<fs::path> csv_files;
@@ -529,11 +593,11 @@ static bool download_attendee_report(fs::path& output_csv_path,
     }
 
     if (!csv_files.empty()) {
-        std::cout << "Existing Constant Contact 'Attendee report' CSV files found in the output folder:\n";
+        std::cout << "Choose from existing registration spreadsheets, or create a new registration spreadsheet using the Constant Contact API:\n";
         for (size_t i = 0; i < csv_files.size(); ++i) {
             std::cout << "  " << (i + 1) << ". " << csv_files[i].filename().string() << "\n";
         }
-        std::cout << "  " << (csv_files.size() + 1) << ". Download new data from Constant Contact API\n";
+        std::cout << "  " << (csv_files.size() + 1) << ". Create a new registration spreadsheet using the Constant Contact API\n";
         int csv_choice = 0;
         while (true) {
             std::cout << "\nChoose an option (enter number): ";
@@ -544,13 +608,13 @@ static bool download_attendee_report(fs::path& output_csv_path,
             std::cout << "Invalid Response\n";
         }
         if (csv_choice != (int)(csv_files.size() + 1)) {
-            output_csv_path = csv_files[csv_choice - 1];
-            std::cout << "Using: " << output_csv_path.filename().string() << "\n";
+            output_reg_spreadsheet_path = csv_files[csv_choice - 1];
+            std::cout << "Using: " << output_reg_spreadsheet_path.filename().string() << "\n";
             // Extract prefix: everything before "Registration Spreadsheet.csv" in the filename.
             // e.g. "2026-03-24.Registration Spreadsheet.csv" -> "2026-03-24."
             //      "test.Registration Spreadsheet.csv"     -> "test."
             //      "Registration Spreadsheet.csv"          -> ""
-            std::string fname = output_csv_path.filename().string();
+            std::string fname = output_reg_spreadsheet_path.filename().string();
             const std::string marker = "Registration Spreadsheet.csv";
             size_t marker_pos = fname.find(marker);
             if (marker_pos != std::string::npos && marker_pos > 0) {
@@ -558,11 +622,24 @@ static bool download_attendee_report(fs::path& output_csv_path,
                 out_event_date = fname.substr(0, marker_pos - 1); // remove trailing '.'
             }
             // out_event_date remains empty if the file is plain "Registration Spreadsheet.csv"
+
+            // Prompt for event title (no API source available when using existing CSV)
+            while (true) {
+                std::cout << "Enter the event title you want to appear on the Attendance Sheet: ";
+                std::getline(std::cin, out_event_title);
+                out_event_title = trim(out_event_title);
+                if (!out_event_title.empty()) break;
+                std::cout << "Invalid Response\n";
+            }
+
             return true;
         }
+        // User chose "Create a new registration spreadsheet using the Constant Contact API"
+        std::cout << "To create a new registration spreadsheet using the Constant Contact API, you need two credentials:\n";
+    } else {
+        std::cout << "No existing registration spreadsheets were found.\n";
+        std::cout << "To create a new registration spreadsheet using the Constant Contact API, you need two credentials:\n";
     }
-
-    std::cout << "To download from Constant Contact API, you need two credentials:\n";
     std::cout << "  1) API Key (Client ID)\n";
     std::cout << "  2) OAuth2 Access Token\n\n";
 
@@ -590,7 +667,10 @@ static bool download_attendee_report(fs::path& output_csv_path,
     if (api_key.empty()) {
         if (!fs::exists(g_token_file_path))
             std::cout << "File " << g_token_file_path.string() << " was not found.\n";
-        std::cout << "Enter your API Key / Client ID (or press Enter to skip API download): ";
+        if (!tokens.api_key.empty())
+            std::cout << "Enter your API Key / Client ID (or press Enter to skip API download): ***Warning: Providing this information permanently replaces the current values***\n";
+        else
+            std::cout << "Enter your API Key / Client ID (or press Enter to skip API download): ";
         std::getline(std::cin, api_key);
         api_key = trim(api_key);
     }
@@ -654,17 +734,20 @@ static bool download_attendee_report(fs::path& output_csv_path,
         }
     }
 
-    // --- API failure handler: write to messages\errors.log and display structured instructions ---
+    // --- API failure handler: write to messages\error.log and security.log, display structured instructions ---
     auto api_failure = [&](const std::string& error_detail) -> bool {
-        write_error_log(1, "Accessing the Constant Contact service failed.", error_detail);
+        write_error_log(16, "Could not obtain attendee report CSV.", error_detail);
+        std::cerr << "\nError16: Could not obtain attendee report CSV.\n";
+        write_error_log(1, "Accessing the Constant Contact service failed. Check your Internet access.", error_detail);
+        write_security_log(6, "Constant Contact API access failure (program terminated)", error_detail);
         std::string out_folder = output_dir.string();
-        std::string log_ref = g_errors_log_path.empty()
-            ? (out_folder + "\\..\\messages\\errors.log")
-            : g_errors_log_path.string();
-        std::cerr << "\nError01: Accessing the Constant Contact service failed.\n"
+        std::string log_ref = g_error_log_path.empty()
+            ? (out_folder + "\\..\\messages\\error.log")
+            : g_error_log_path.string();
+        std::cerr << "Error01: Accessing the Constant Contact service failed. Check your Internet access.\n"
                   << "How to Proceed:\n"
                   << "Step 1: Login to Constant Contact (https://login.constantcontact.com/)\n"
-                  << "Step 2: Export a Constant Contact CSV file of type 'Attendee report' for the event you are interested in, naming it in the format YYYY-MM-DD.TICKETTYPE.Registration Spreadsheet.csv. For example, 2026-03-24.New York City.Registration Spreadsheet.csv\n"
+                  << "Step 2: Export a Constant Contact CSV file of type 'Attendee report' for the event you are interested in, naming it in the format YYYY-MM-DD.Registration Spreadsheet.csv. For example, 2026-03-24.Registration Spreadsheet.csv\n"
                   << "Step 3: Save the exported CSV file to the folder " << out_folder << "\n"
                   << "Step 4: Rerun " << g_exe_name << " with the CSV file you just exported.\n"
                   << "Step 5: Contact your Event Coordinator to report this error, including a copy of the file " << log_ref << "\n";
@@ -760,14 +843,37 @@ static bool download_attendee_report(fs::path& output_csv_path,
     // Build event title and extract date from event name
     {
         std::string name = records[ev_idx - 1].value("name", "Unnamed Event");
-        out_event_title = name;
         out_event_date = parse_event_date(name);  // YYYY-MM-DD from "Month DD, YYYY ..." name
+
+        // Confirm or override the event title for the Attendance Sheet
+        std::cout << "The event title that will appear on the Attendance Sheet is '" << name << "'.\n";
+        std::string accept;
+        while (true) {
+            std::cout << "Accept this event title? (y/n): ";
+            std::getline(std::cin, accept);
+            accept = trim(accept);
+            if (accept.size() == 1 && (accept[0] == 'y' || accept[0] == 'Y')) {
+                out_event_title = name;
+                break;
+            } else if (accept.size() == 1 && (accept[0] == 'n' || accept[0] == 'N')) {
+                while (true) {
+                    std::cout << "Enter the event title you want to appear on the Attendance Sheet: ";
+                    prefill_console_input(name);
+                    std::getline(std::cin, out_event_title);
+                    out_event_title = trim(out_event_title);
+                    if (!out_event_title.empty()) break;
+                    std::cout << "Invalid Response\n";
+                }
+                break;
+            }
+            std::cout << "Invalid Response\n";
+        }
     }
 
     // Now that we have the event date, set the actual output CSV file path
     {
         std::string prefix = out_event_date.empty() ? "" : (out_event_date + ".");
-        output_csv_path = output_dir / (prefix + "Registration Spreadsheet.csv");
+        output_reg_spreadsheet_path = output_dir / (prefix + "Registration Spreadsheet.csv");
     }
 
     // --- Get event details for the track_id ---
@@ -874,21 +980,21 @@ static bool download_attendee_report(fs::path& output_csv_path,
 
     // --- Build CSV from registrations ---
     // If the file is locked (e.g. open in Excel), warn the user
-    if (fs::exists(output_csv_path)) {
-        std::ofstream test(output_csv_path, std::ios::app);
+    if (fs::exists(output_reg_spreadsheet_path)) {
+        std::ofstream test(output_reg_spreadsheet_path, std::ios::app);
         if (!test.is_open()) {
             std::cerr << "Error: CSV file is locked (close Excel first): "
-                      << output_csv_path.string() << "\n";
+                      << output_reg_spreadsheet_path.string() << "\n";
             std::cout << "Close the file and press Enter to retry...";
             std::string dummy;
             std::getline(std::cin, dummy);
         }
     }
-    std::ofstream csv_out(output_csv_path);
+    std::ofstream csv_out(output_reg_spreadsheet_path);
     if (!csv_out.is_open()) {
         write_error_log(5, "Cannot write Registration Spreadsheet CSV.",
-            "Path: " + output_csv_path.string());
-        std::cerr << "Error: Cannot create CSV file at " << output_csv_path.string() << "\n";
+            "Path: " + output_reg_spreadsheet_path.string());
+        std::cerr << "Error: Cannot create CSV file at " << output_reg_spreadsheet_path.string() << "\n";
         return false;
     }
 
@@ -1016,7 +1122,7 @@ static bool download_attendee_report(fs::path& output_csv_path,
     }
 
     csv_out.close();
-    std::cout << "Registration data saved to: " << output_csv_path.string() << "\n";
+    std::cout << "Registration data saved to: " << output_reg_spreadsheet_path.string() << "\n";
     return true;
 }
 
@@ -1154,6 +1260,13 @@ static bool populate_attendance_sheet(const fs::path& docx_path,
                     if (t) runs.push_back({t, std::string(t.child_value())});
                 }
                 size_t pos = para_text.find("New York City");
+                // If the character immediately before the match is not a space
+                // (e.g., the en dash "–" ends in 0x93 with no trailing space in
+                // the XML), insert a space so the venue name is not run together
+                // with the preceding punctuation.
+                std::string replacement_text = venue_name;
+                if (pos > 0 && static_cast<unsigned char>(para_text[pos - 1]) != ' ')
+                    replacement_text = " " + venue_name;
                 size_t find_len = 13; // strlen("New York City")
                 size_t char_offset = 0;
                 for (size_t i = 0; i < runs.size(); ++i) {
@@ -1165,8 +1278,13 @@ static bool populate_attendance_sheet(const fs::path& docx_path,
                         std::string after_match;
                         if (match_here >= find_len)
                             after_match = runs[i].text.substr(pos - run_start + find_len);
-                        runs[i].t_node.text().set((before + venue_name + after_match).c_str());
-                        runs[i].t_node.attribute("xml:space").set_value("preserve");
+                        runs[i].t_node.text().set((before + replacement_text + after_match).c_str());
+                        // Ensure xml:space="preserve" so Word keeps any leading/trailing
+                        // whitespace in the replacement text (e.g. the space prepended above).
+                        {
+                            auto xs = runs[i].t_node.attribute("xml:space");
+                            if (!xs) runs[i].t_node.append_attribute("xml:space").set_value("preserve");
+                        }
                         size_t remaining = find_len - match_here;
                         for (size_t j = i + 1; j < runs.size() && remaining > 0; ++j) {
                             size_t consume = std::min(remaining, runs[j].text.size());
@@ -1857,7 +1975,7 @@ static bool convert_to_pdf(const fs::path& doc_path, const fs::path& pdf_path,
 
             pDoc->Release();
         } else {
-            std::cerr << "  Error: Failed to open document in Word.\n";
+            std::cerr << "  Error17: Failed to open document in Word. Syncing the file with OneDrive while there isn't Internet access is a possible cause.\n";
         }
 
         pDocs->Release();
@@ -1877,12 +1995,378 @@ static bool convert_to_pdf(const fs::path& doc_path, const fs::path& pdf_path,
 }
 
 // ============================================================================
+// OAuth2 Setup Wizard (--setup)
+// ============================================================================
+
+static int run_setup(int argc, char* argv[]) {
+    std::cout << "=== ISC2 Event Coordinator - OAuth2 Setup ===\n\n";
+    std::cout << "This wizard obtains an access token and refresh token from Constant Contact\n";
+    std::cout << "and saves them to tokens.json for use by this program.\n\n";
+
+    // Determine base directory (same logic as run(), but does not require templates)
+    fs::path exe_path = fs::path(argv[0]).parent_path();
+    fs::path base_dir;
+    if (fs::exists(exe_path / "input templates")) {
+        base_dir = exe_path;
+    } else if (fs::exists(fs::current_path() / "input templates")) {
+        base_dir = fs::current_path();
+    } else {
+        base_dir = exe_path.empty() ? fs::current_path() : exe_path;
+        std::cout << "Note: 'input templates' folder not found. Tokens will be saved to:\n";
+        std::cout << "  " << base_dir.string() << "\n\n";
+    }
+
+    g_token_file_path   = base_dir / "tokens.json";
+    g_exe_name          = fs::path(argv[0]).filename().string();
+    g_error_log_path    = base_dir / "messages" / "error.log";
+    g_security_log_path = base_dir / "messages" / "security.log";
+    fs::create_directories(base_dir / "messages");
+
+    // Load existing tokens as defaults
+    ConstantContactTokens tokens = load_tokens();
+
+    // Prompt for API key
+    std::string api_key;
+    if (!tokens.api_key.empty()) {
+        std::cout << "Saved API Key: " << tokens.api_key.substr(0, 8) << "...\n";
+        std::cout << "Press Enter to keep it, or type a new API Key / Client ID: ";
+        std::getline(std::cin, api_key);
+        api_key = trim(api_key);
+        if (api_key.empty()) api_key = tokens.api_key;
+    } else {
+        std::cout << "Enter your API Key / Client ID: ";
+        std::getline(std::cin, api_key);
+        api_key = trim(api_key);
+    }
+    if (api_key.empty()) {
+        std::cerr << "API Key is required.\n";
+        return 1;
+    }
+
+    // Prompt for client secret
+    std::string client_secret;
+    if (!tokens.client_secret.empty()) {
+        std::cout << "Saved Client Secret: (masked)\n";
+        std::cout << "Press Enter to keep it, or type a new Client Secret: ";
+        std::getline(std::cin, client_secret);
+        client_secret = trim(client_secret);
+        if (client_secret.empty()) client_secret = tokens.client_secret;
+    } else {
+        std::cout << "Enter your Client Secret: ";
+        std::getline(std::cin, client_secret);
+        client_secret = trim(client_secret);
+    }
+    if (client_secret.empty()) {
+        std::cerr << "Client Secret is required.\n";
+        return 1;
+    }
+
+    // Initialize Winsock
+    WSADATA wsa_data;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+        std::cerr << "Error: Failed to initialize Winsock.\n";
+        return 1;
+    }
+
+    // Bind to an available local port (8080-8089)
+    SOCKET listen_sock = INVALID_SOCKET;
+    int port = 0;
+    for (int try_port = 8080; try_port <= 8089; ++try_port) {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) continue;
+        BOOL reuse = TRUE;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(static_cast<u_short>(try_port));
+        if (bind(s, reinterpret_cast<SOCKADDR*>(&addr), sizeof(addr)) == 0) {
+            listen_sock = s;
+            port = try_port;
+            break;
+        }
+        closesocket(s);
+    }
+    if (listen_sock == INVALID_SOCKET || port == 0) {
+        std::cerr << "Error: Could not bind to any local port in range 8080-8089.\n";
+        WSACleanup();
+        return 1;
+    }
+    if (listen(listen_sock, 1) != 0) {
+        std::cerr << "Error: Failed to listen on port " << port << ".\n";
+        closesocket(listen_sock);
+        WSACleanup();
+        return 1;
+    }
+
+    // Generate a random state value for CSRF protection
+    std::string state;
+    {
+        HCRYPTPROV hProv = 0;
+        if (CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+            BYTE state_bytes[16] = {};
+            CryptGenRandom(hProv, sizeof(state_bytes), state_bytes);
+            CryptReleaseContext(hProv, 0);
+            char hex_buf[33] = {};
+            for (int i = 0; i < 16; ++i)
+                snprintf(hex_buf + i * 2, 3, "%02x", state_bytes[i]);
+            state = hex_buf;
+        } else {
+            state = std::to_string(GetTickCount64());
+        }
+    }
+
+    std::string redirect_uri = "http://localhost:" + std::to_string(port) + "/callback";
+
+    // Percent-encode the redirect URI for the authorization URL query string
+    auto url_encode = [](const std::string& s) -> std::string {
+        std::string result;
+        for (unsigned char c : s) {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+                result += static_cast<char>(c);
+            else {
+                char pct[4];
+                snprintf(pct, sizeof(pct), "%%%02X", c);
+                result += pct;
+            }
+        }
+        return result;
+    };
+
+    std::string auth_url =
+        "https://authz.constantcontact.com/oauth2/default/v1/authorize"
+        "?client_id=" + api_key +
+        "&redirect_uri=" + url_encode(redirect_uri) +
+        "&response_type=code"
+        "&scope=offline_access+campaign_data+contact_data"
+        "&state=" + state;
+
+    std::cout << "\nThis setup will use the following OAuth2 redirect URI:\n";
+    std::cout << "  " << redirect_uri << "\n\n";
+    std::cout << "IMPORTANT: This URI must be registered as a Redirect URI in your\n";
+    std::cout << "Constant Contact application settings at:\n";
+    std::cout << "  https://app.constantcontact.com/pages/dma/portal/\n\n";
+    std::cout << "Press Enter to open your browser for authorization...";
+    { std::string dummy; std::getline(std::cin, dummy); }
+
+    ShellExecuteW(nullptr, L"open", utf8_to_wide(auth_url).c_str(),
+                  nullptr, nullptr, SW_SHOWNORMAL);
+
+    std::cout << "\nWaiting for authorization callback (timeout: 2 minutes)...\n";
+    std::cout << "If your browser did not open, navigate to:\n  " << auth_url << "\n";
+
+    // Wait up to 120 seconds for the browser redirect
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(listen_sock, &read_fds);
+    TIMEVAL tv = { 120, 0 };
+    int sel = select(0, &read_fds, nullptr, nullptr, &tv);
+    if (sel <= 0) {
+        closesocket(listen_sock);
+        WSACleanup();
+        std::cerr << (sel == 0 ? "\nError: Timed out waiting for authorization callback.\n"
+                               : "\nError: Network error while waiting for callback.\n");
+        return 1;
+    }
+
+    SOCKET client_sock = accept(listen_sock, nullptr, nullptr);
+    closesocket(listen_sock);
+    if (client_sock == INVALID_SOCKET) {
+        WSACleanup();
+        std::cerr << "Error: Failed to accept callback connection.\n";
+        return 1;
+    }
+
+    // Read the HTTP request (headers only needed)
+    std::string request;
+    {
+        char buf[4096] = {};
+        DWORD recv_timeout = 10000;
+        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&recv_timeout), sizeof(recv_timeout));
+        int n = recv(client_sock, buf, sizeof(buf) - 1, 0);
+        if (n > 0) request.assign(buf, static_cast<size_t>(n));
+    }
+
+    // Parse code, state, and error from the request line query string
+    std::string code, received_state, error_val;
+    {
+        auto line_end = request.find("\r\n");
+        std::string request_line = (line_end != std::string::npos)
+            ? request.substr(0, line_end) : request;
+        auto q_pos    = request_line.find('?');
+        auto space_pos = request_line.rfind(' ');
+        if (q_pos != std::string::npos) {
+            size_t q_end = (space_pos != std::string::npos && space_pos > q_pos)
+                ? space_pos : request_line.size();
+            std::string query = request_line.substr(q_pos + 1, q_end - q_pos - 1);
+            std::istringstream qs(query);
+            std::string param;
+            while (std::getline(qs, param, '&')) {
+                auto eq = param.find('=');
+                if (eq == std::string::npos) continue;
+                std::string key = param.substr(0, eq);
+                std::string raw = param.substr(eq + 1);
+                // URL-decode value
+                std::string val;
+                for (size_t i = 0; i < raw.size(); ++i) {
+                    if (raw[i] == '%' && i + 2 < raw.size() &&
+                        std::isxdigit(static_cast<unsigned char>(raw[i+1])) &&
+                        std::isxdigit(static_cast<unsigned char>(raw[i+2]))) {
+                        char hex[3] = { raw[i+1], raw[i+2], 0 };
+                        val += static_cast<char>(std::strtol(hex, nullptr, 16));
+                        i += 2;
+                    } else if (raw[i] == '+') {
+                        val += ' ';
+                    } else {
+                        val += raw[i];
+                    }
+                }
+                if (key == "code")  code = val;
+                else if (key == "state") received_state = val;
+                else if (key == "error") error_val = val;
+            }
+        }
+    }
+
+    // Send response to browser
+    bool auth_ok = !code.empty() && received_state == state;
+    std::string html_body = auth_ok
+        ? "<html><body style=\"font-family:sans-serif;padding:2em\">"
+          "<h2 style=\"color:green\">Authorization Successful</h2>"
+          "<p>You can close this tab and return to ISC2 Event Coordinator.</p>"
+          "</body></html>"
+        : "<html><body style=\"font-family:sans-serif;padding:2em\">"
+          "<h2 style=\"color:red\">Authorization Failed</h2>"
+          "<p>Please return to ISC2 Event Coordinator and try again.</p>"
+          "</body></html>";
+    std::string http_resp =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: " + std::to_string(html_body.size()) + "\r\n"
+        "Connection: close\r\n"
+        "\r\n" + html_body;
+    send(client_sock, http_resp.c_str(), static_cast<int>(http_resp.size()), 0);
+    closesocket(client_sock);
+    WSACleanup();
+
+    if (!error_val.empty()) {
+        std::cerr << "\nError: Authorization denied: " << error_val << "\n";
+        return 1;
+    }
+    if (code.empty()) {
+        std::cerr << "\nError: No authorization code received in callback.\n";
+        return 1;
+    }
+    if (received_state != state) {
+        std::cerr << "\nError: State mismatch in OAuth callback (possible CSRF).\n";
+        return 1;
+    }
+
+    std::cout << "\nAuthorization code received. Exchanging for tokens...\n";
+
+    // Build Basic auth header
+    std::string credentials = api_key + ":" + client_secret;
+    DWORD b64_len = 0;
+    CryptBinaryToStringA(reinterpret_cast<const BYTE*>(credentials.c_str()),
+                         static_cast<DWORD>(credentials.size()),
+                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &b64_len);
+    std::string b64(b64_len, '\0');
+    CryptBinaryToStringA(reinterpret_cast<const BYTE*>(credentials.c_str()),
+                         static_cast<DWORD>(credentials.size()),
+                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, b64.data(), &b64_len);
+    b64.resize(b64_len);
+    while (!b64.empty() && b64.back() == '\0') b64.pop_back();
+
+    std::string post_body = "grant_type=authorization_code"
+                            "&code=" + url_encode(code) +
+                            "&redirect_uri=" + url_encode(redirect_uri);
+
+    // POST to token endpoint
+    std::string token_response;
+    HINTERNET hSession = WinHttpOpen(L"ISC2EventCoordinator/1.0",
+                                     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                     WINHTTP_NO_PROXY_NAME,
+                                     WINHTTP_NO_PROXY_BYPASS, 0);
+    if (hSession) {
+        HINTERNET hConnect = WinHttpConnect(hSession, L"authz.constantcontact.com",
+                                            INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (hConnect) {
+            HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST",
+                                                    L"/oauth2/default/v1/token",
+                                                    nullptr, WINHTTP_NO_REFERER,
+                                                    WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                                    WINHTTP_FLAG_SECURE);
+            if (hRequest) {
+                std::wstring auth_hdr = L"Authorization: Basic " + utf8_to_wide(b64);
+                WinHttpAddRequestHeaders(hRequest, auth_hdr.c_str(), (DWORD)-1,
+                                         WINHTTP_ADDREQ_FLAG_ADD);
+                WinHttpAddRequestHeaders(hRequest,
+                                         L"Content-Type: application/x-www-form-urlencoded",
+                                         (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+                if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                       (LPVOID)post_body.c_str(), (DWORD)post_body.size(),
+                                       (DWORD)post_body.size(), 0) &&
+                    WinHttpReceiveResponse(hRequest, nullptr)) {
+                    DWORD size = 0;
+                    do {
+                        WinHttpQueryDataAvailable(hRequest, &size);
+                        if (size > 0) {
+                            std::vector<char> rbuf(size + 1, 0);
+                            DWORD downloaded = 0;
+                            WinHttpReadData(hRequest, rbuf.data(), size, &downloaded);
+                            token_response.append(rbuf.data(), downloaded);
+                        }
+                    } while (size > 0);
+                }
+                WinHttpCloseHandle(hRequest);
+            }
+            WinHttpCloseHandle(hConnect);
+        }
+        WinHttpCloseHandle(hSession);
+    }
+
+    if (token_response.empty()) {
+        std::cerr << "Error: Empty response from token endpoint.\n";
+        return 1;
+    }
+
+    try {
+        json resp = json::parse(token_response);
+        if (!resp.contains("access_token")) {
+            std::cerr << "Error: Token exchange failed.\n  "
+                      << resp.value("error", "unknown") << ": "
+                      << resp.value("error_description", token_response.substr(0, 300)) << "\n";
+            return 1;
+        }
+        tokens.api_key       = api_key;
+        tokens.client_secret = client_secret;
+        tokens.access_token  = resp["access_token"].get<std::string>();
+        tokens.refresh_token = resp.value("refresh_token", "");
+        save_tokens(tokens);
+        std::cout << "\nSetup complete. Credentials saved to:\n";
+        std::cout << "  " << g_token_file_path.string() << "\n\n";
+        if (tokens.refresh_token.empty()) {
+            std::cout << "Note: No refresh token was returned. Re-run --setup when the access token expires.\n";
+        } else {
+            std::cout << "A refresh token was saved. The program will renew the access token automatically.\n";
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: Failed to parse token response: " << e.what() << "\n";
+        std::cerr << "Response: " << token_response.substr(0, 500) << "\n";
+        return 1;
+    }
+}
+
+// ============================================================================
 // Main Program
 // ============================================================================
 
 static int run(int argc, char* argv[]) {
     std::cout << "=== ISC2 Event Coordinator ===\n";
-    std::cout << "Generates Attendance Sheet and Name Tag documents from Constant Contact data.\n\n";
+    std::cout << "Generates an Attendance Sheet (sign-in sheet), Attendee Name Tag Labels, and a Registration List (attendee names and email addresses) from Constant Contact event registration data).\n\n";
 
     // Determine base directory (where the executable is, or the project root)
     fs::path exe_path = fs::path(argv[0]).parent_path();
@@ -1902,16 +2386,19 @@ static int run(int argc, char* argv[]) {
     fs::path input_dir = base_dir / "input templates";
     fs::path output_dir = base_dir / "output";
     fs::create_directories(output_dir);
+    fs::path reg_spreadsheets_dir = base_dir / "Registration Spreadsheets";
+    fs::create_directories(reg_spreadsheets_dir);
 
     // Set error log path and create messages directory
-    g_errors_log_path = base_dir / "messages" / "errors.log";
+    g_error_log_path    = base_dir / "messages" / "error.log";
+    g_security_log_path = base_dir / "messages" / "security.log";
     fs::create_directories(base_dir / "messages");
 
     // Set token file path and executable name for credential persistence and error messages
     g_token_file_path = base_dir / "tokens.json";
     g_exe_name = fs::path(argv[0]).filename().string();
 
-    fs::path csv_path = output_dir; // Let download_attendee_report handle CSV selection
+    fs::path reg_spreadsheet_path = reg_spreadsheets_dir; // Let download_attendee_report handle CSV selection
     fs::path attendance_template = input_dir / "Attendance Sheet.docx";
     fs::path nametag_template = input_dir / "Name Tag Template.docx";
     // Output paths — will be updated with date/venue prefix after Steps 1-2
@@ -1939,20 +2426,19 @@ static int run(int argc, char* argv[]) {
     // ========================================================================
     std::string event_title;
     std::string event_date;
-    if (!download_attendee_report(csv_path, event_title, event_date)) {
-        std::cerr << "Error: Could not obtain attendee report CSV.\n";
+    if (!download_attendee_report(reg_spreadsheet_path, event_title, event_date)) {
         return 1;
     }
 
     // ========================================================================
     // Step 2: Parse CSV and process attendee data
     // ========================================================================
-    std::cout << "\n=== Step 2: Process Registration Spreadsheet ===\n\n";
+    std::cout << "\n=== Step 2: Process the Registration Spreadsheet ===\n\n";
 
-    auto csv_rows = parse_csv(csv_path.string());
+    auto csv_rows = parse_csv(reg_spreadsheet_path.string());
     if (csv_rows.size() < 2) {
         write_error_log(8, "CSV file is empty or has no data rows.",
-            "Path: " + csv_path.string());
+            "Path: " + reg_spreadsheet_path.string());
         std::cerr << "Error: CSV file is empty or has no data rows.\n";
         return 1;
     }
@@ -2076,16 +2562,18 @@ static int run(int argc, char* argv[]) {
         attendee_names.push_back(e.name);
         attendee_email_list.push_back(e.email);
     }
+    std::cout << "Attendees: (" << attendee_names.size() << " total";
     if (duplicates_removed > 0)
-        std::cout << "  Note: " << duplicates_removed << " duplicate name(s) removed.\n";
-
-    std::cout << "Attendees (" << attendee_names.size() << " total):\n";
+        std::cout << ". " << duplicates_removed << " duplicate name(s) removed";
+    std::cout << ")\n";
     for (size_t i = 0; i < attendee_names.size(); ++i) {
         std::cout << "  " << (i + 1) << ". " << attendee_names[i] << "\n";
     }
 
     // Derive venue name: all but last word of selected ticket type
     // e.g., "Long Island Admission" -> "Long Island"
+    // ticket_type_prefix is used in output filenames and is always the ticket-derived value.
+    // venue_name may be overridden by the user and is used only in the document placeholder.
     std::string venue_name;
     {
         size_t last_space = ticket_type_selected.rfind(' ');
@@ -2094,12 +2582,41 @@ static int run(int argc, char* argv[]) {
         else
             venue_name = ticket_type_selected;
     }
+    const std::string ticket_type_prefix = venue_name;  // locked before any user override
 
-    // Build filename prefix: "YYYY-MM-DD.VenueName." or just "VenueName."
-    // event_date holds the CSV filename prefix (e.g. "2026-03-24", "test", or "").
-    // venue_name is all but the last word of the selected ticket type.
+    // Confirm or override the event venue for the Attendance Sheet
     {
-        std::string file_prefix = (event_date.empty() ? "" : (event_date + ".")) + venue_name + ".";
+        std::cout << "\nThe event venue that will appear on the Attendance Sheet is '" << venue_name << "', and will be written as '" << venue_name << " Venue'.\n";
+        std::string accept;
+        while (true) {
+            std::cout << "Accept this event venue? (y/n): ";
+            std::getline(std::cin, accept);
+            accept = trim(accept);
+            if (accept.size() == 1 && (accept[0] == 'y' || accept[0] == 'Y')) {
+                break;
+            } else if (accept.size() == 1 && (accept[0] == 'n' || accept[0] == 'N')) {
+                std::string input;
+                while (true) {
+                    std::cout << "Enter the event venue you want to appear on the Attendance Sheet: ";
+                    prefill_console_input(venue_name);
+                    std::getline(std::cin, input);
+                    input = trim(input);
+                    if (!input.empty()) break;
+                    std::cout << "Invalid Response\n";
+                }
+                venue_name = input;
+                std::cout << "The event venue that will appear on the Attendance Sheet is '" << venue_name << "', and will be written as '" << venue_name << " Venue'.\n";
+                break;
+            }
+            std::cout << "Invalid Response\n";
+        }
+    }
+
+    // Build filename prefix: "YYYY-MM-DD.TicketTypeSelected." or just "TicketTypeSelected."
+    // event_date holds the CSV filename prefix (e.g. "2026-03-24", "test", or "").
+    // ticket_type_prefix is all but the last word of the selected ticket type (never overridden).
+    {
+        std::string file_prefix = (event_date.empty() ? "" : (event_date + ".")) + ticket_type_prefix + ".";
         attendance_output = output_dir / (file_prefix + "Attendance Sheet.docx");
         nametag_output    = output_dir / (file_prefix + "Name Tag Template.docx");
         attendance_pdf    = output_dir / (file_prefix + "Attendance Sheet.pdf");
@@ -2109,9 +2626,9 @@ static int run(int argc, char* argv[]) {
     // ========================================================================
     // Step 4: Create Registration List CSV
     // ========================================================================
-    std::cout << "\n=== Step 4: Create Registration List ===\n\n";
+    std::cout << "\n=== Step 3: Create Registration List ===\n\n";
     {
-        std::string file_prefix = (event_date.empty() ? "" : (event_date + ".")) + venue_name + ".";
+        std::string file_prefix = (event_date.empty() ? "" : (event_date + ".")) + ticket_type_prefix + ".";
         fs::path reg_list_path = output_dir / (file_prefix + "Registration List.csv");
         std::ofstream reg_csv(reg_list_path);
         if (!reg_csv.is_open()) {
@@ -2132,7 +2649,7 @@ static int run(int argc, char* argv[]) {
     // ========================================================================
     // Step 5: Create Attendance Sheet
     // ========================================================================
-    std::cout << "\n=== Step 5: Create Attendance Sheet ===\n\n";
+    std::cout << "\n=== Step 4: Create Attendance Sheet ===\n\n";
 
     // Copy template to output
     try {
@@ -2158,7 +2675,7 @@ static int run(int argc, char* argv[]) {
     // ========================================================================
     // Step 6: Create Name Tag Template
     // ========================================================================
-    std::cout << "\n=== Step 6: Create Name Tag Template ===\n\n";
+    std::cout << "\n=== Step 5: Create Name Tag Template ===\n\n";
 
     // Copy template to output
     try {
@@ -2183,20 +2700,22 @@ static int run(int argc, char* argv[]) {
     // ========================================================================
     // Step 7: Convert Attendance Sheet to PDF
     // ========================================================================
-    std::cout << "\n=== Step 7: Convert Attendance Sheet to PDF ===\n\n";
+    std::cout << "\n=== Step 6: Convert Attendance Sheet to PDF ===\n\n";
 
-    if (!convert_to_pdf(attendance_output, attendance_pdf)) {
-        std::cerr << "Warning: PDF conversion failed for Attendance Sheet.\n";
+    const bool attendance_pdf_created = convert_to_pdf(attendance_output, attendance_pdf);
+    if (!attendance_pdf_created) {
+        std::cerr << "  Error18: PDF conversion failed for Attendance Sheet.\n";
         std::cerr << "  You can open " << attendance_output.string() << " in Word and save as PDF manually.\n";
     }
 
     // ========================================================================
     // Step 8: Convert Name Tag Template to PDF
     // ========================================================================
-    std::cout << "\n=== Step 8: Convert Name Tag Template to PDF ===\n\n";
+    std::cout << "\n=== Step 7: Convert Name Tag Template to PDF ===\n\n";
 
-    if (!convert_to_pdf(nametag_output, nametag_pdf, true)) {
-        std::cerr << "Warning: PDF conversion failed for Name Tag Template.\n";
+    const bool nametag_pdf_created = convert_to_pdf(nametag_output, nametag_pdf, true);
+    if (!nametag_pdf_created) {
+        std::cerr << "  Error19: PDF conversion failed for Name Tag Template.\n";
         std::cerr << "  You can open " << nametag_output.string() << " in Word and save as PDF manually.\n";
     }
 
@@ -2205,12 +2724,12 @@ static int run(int argc, char* argv[]) {
     // ========================================================================
     std::cout << "\n=== Processing Complete ===\n\n";
     std::cout << "Output files:\n";
-    std::cout << "  CSV:        " << csv_path.string() << "\n";
+    std::cout << "  CSV:        " << reg_spreadsheet_path.string() << "\n";
     std::cout << "  Attendance: " << attendance_output.string() << "\n";
     std::cout << "  Name Tags:  " << nametag_output.string() << "\n";
-    if (fs::exists(attendance_pdf))
+    if (attendance_pdf_created)
         std::cout << "  Attend PDF: " << attendance_pdf.string() << "\n";
-    if (fs::exists(nametag_pdf))
+    if (nametag_pdf_created)
         std::cout << "  Tags PDF:   " << nametag_pdf.string() << "\n";
 
     return 0;
@@ -2218,8 +2737,12 @@ static int run(int argc, char* argv[]) {
 
 int main(int argc, char* argv[]) {
     int result = 0;
+    bool setup_mode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--setup") { setup_mode = true; break; }
+    }
     try {
-        result = run(argc, argv);
+        result = setup_mode ? run_setup(argc, argv) : run(argc, argv);
     } catch (const std::exception& e) {
         write_error_log(14, "Unexpected error.", std::string(e.what()));
         std::cerr << "\nUnexpected error: " << e.what() << "\n";

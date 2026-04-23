@@ -31,6 +31,7 @@ target_link_libraries(EventCoordinator PRIVATE
     nlohmann_json::nlohmann_json
     winhttp
     crypt32
+    ws2_32
     ole32
     oleaut32
     uuid

@@ -58,18 +58,72 @@ if (-not $TranscriptPath) {
     # Find the workspaceStorage folder that owns this workspace by looking for
     # a workspace.json whose "folder" points at our working directory.
 
-    $storageId = Get-ChildItem $copilotRoot -Directory | Where-Object {
+    $storageId = Get-ChildItem $copilotRoot -Directory | ForEach-Object {
         $wsjson = Join-Path $_.FullName "workspace.json"
-        if (Test-Path $wsjson) {
-            try {
-                $ws  = Get-Content $wsjson -Raw | ConvertFrom-Json
-                # VS Code stores the folder as a URI, e.g. file:///d%3A/Users/foo%20bar/...
-                $raw = $ws.folder -replace '^file:///', ''
-                $decoded = [System.Uri]::UnescapeDataString($raw)   # handles %3A, %20, etc.
-                $decoded.TrimEnd('/\').Replace('/', '\') -ieq $workspaceFolder
-            } catch { $false }
-        } else { $false }
-    } | Select-Object -First 1 -ExpandProperty FullName
+        if (-not (Test-Path $wsjson)) { return }
+        try {
+            $ws = Get-Content $wsjson -Raw | ConvertFrom-Json
+
+            $folderMatches = $false
+
+            # Case 1: "folder" URI — matches if equal to or a parent of current directory
+            if ($ws.folder) {
+                $raw     = $ws.folder -replace '^file:///', ''
+                $decoded = [System.Uri]::UnescapeDataString($raw).TrimEnd('/\').Replace('/', '\')
+                if ($workspaceFolder -ieq $decoded -or $workspaceFolder.StartsWith($decoded + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $folderMatches = $true
+                }
+            }
+
+            # Helper: check if a workspace file's folders[] contains CWD
+            $checkWorkspaceFile = {
+                param($wsFilePath)
+                if (-not (Test-Path $wsFilePath)) { return $false }
+                try {
+                    $wsFile    = Get-Content $wsFilePath -Raw | ConvertFrom-Json
+                    $wsFileDir = Split-Path $wsFilePath -Parent
+                    foreach ($f in $wsFile.folders) {
+                        $fp = $f.path
+                        if (-not [System.IO.Path]::IsPathRooted($fp)) {
+                            $fp = Join-Path $wsFileDir $fp
+                        }
+                        $resolved = [System.IO.Path]::GetFullPath($fp).TrimEnd('\')
+                        if ($workspaceFolder -ieq $resolved -or $workspaceFolder.StartsWith($resolved + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                            return $true
+                        }
+                    }
+                } catch {}
+                return $false
+            }
+
+            # Case 2: "configuration" URI — named .code-workspace file
+            if (-not $folderMatches -and $ws.configuration) {
+                $raw        = $ws.configuration -replace '^file:///', ''
+                $wsFilePath = [System.Uri]::UnescapeDataString($raw).Replace('/', '\')
+                $folderMatches = & $checkWorkspaceFile $wsFilePath
+            }
+
+            # Case 3: "workspace" URI — VS Code untitled multi-root workspace
+            # stored in %APPDATA%\Code*\Workspaces\<id>\workspace.json
+            if (-not $folderMatches -and $ws.workspace) {
+                $raw        = $ws.workspace -replace '^file:///', ''
+                $wsFilePath = [System.Uri]::UnescapeDataString($raw).Replace('/', '\')
+                $folderMatches = & $checkWorkspaceFile $wsFilePath
+            }
+
+            if (-not $folderMatches) { return }
+
+            # Rank by most recently written transcript file
+            $tDir   = Join-Path $_.FullName "GitHub.copilot-chat\transcripts"
+            $latest = Get-ChildItem $tDir -Filter "*.jsonl" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            [PSCustomObject]@{
+                StoragePath = $_.FullName
+                LatestTime  = if ($latest) { $latest.LastWriteTime } else { [datetime]::MinValue }
+            }
+        } catch {}
+    } | Sort-Object LatestTime -Descending |
+        Select-Object -First 1 -ExpandProperty StoragePath
 
     if (-not $storageId) {
         Write-Error "Could not locate workspace storage for: $workspaceFolder"
