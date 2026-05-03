@@ -29,4 +29,5 @@ cmake --build "ISC2 Event Coordinator/build" --config Release
 
 #### Usage
 
-Run `EventCoordinator.exe` from the project directory. The program will prompt for Constant Contact credentials or allow selection of an existing Registration Spreadsheet CSV.
+Running EventCoordinator’s OAuth2 Setup Wizard: EventCoordinator --setup
+Running EventCoordinator to generate documents: EventCoordinator
