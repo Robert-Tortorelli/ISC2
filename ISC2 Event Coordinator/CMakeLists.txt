@@ -37,6 +37,7 @@ target_link_libraries(EventCoordinator PRIVATE
     uuid
     shell32
     shlwapi
+    gdiplus
 )
 
 # Copy executable to project root for easy access

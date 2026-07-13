@@ -1,7 +1,13 @@
+# Visual Studio Code Folders
 build/
-tokens.json
-output/
+
+# ISC2 Event Coordinator Folders & Files
+input/
 messages/
+output/
+Registration Spreadsheets/
+Teams Attendance/
+tokens.json
 
 # Chat transcripts
 *.md

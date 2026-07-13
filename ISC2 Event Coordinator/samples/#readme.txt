@@ -1,1 +1,2 @@
-This folder is only used during development. It is not used at runtime.
+These sample files were reorganized into a new folder structure after EventCoordinator V2.0 was developed. As a result GitHub Copilot may have trouble locating them going forward.
+Not all of these files are needed for development; instead they are examples of files created by EventCoordinator V2.0.

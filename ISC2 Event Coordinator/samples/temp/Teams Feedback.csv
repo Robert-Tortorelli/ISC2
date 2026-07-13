@@ -1,0 +1,13 @@
+Name,First Name,Last Name,Hint
+Web_Social_Director (Phillip Martin),Phillip,Martin,First and last names are typically not English words and do not contain special characters like the underscore
+Doyin Diyaolu,Doyin,Diyaolu,
+Thomas tgn.Nohs,,,
+NY - 12 - THE LOCAL,,,
+"Sanford, Anthony",Anthony,Sanford,"The format ""String1, String2"" should be interpreted as ""Last Name, First Name"" unless both strings are English words."
+Ray Sitorus (External),Ray,Sitorus,"Ignore the English word ""External"" and the remainder is ""First Name, Last Name"" or ""First Name, Middle Initial, Last Name""."
+Dr. Nwosisi,,,
+Winston (Unverified),,,
+Aja R (Unverified),,,
+Carlos A. Berenguel (External),Carlos,Berenguel,"Ignore the English word ""External"" and the remainder is ""First Name, Last Name"" or ""First Name, Middle Initial, Last Name""."
+Winston (Unverified),,,
+Winston (Unverified),,,
