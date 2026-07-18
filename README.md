@@ -26,7 +26,9 @@ Attendance Sheets (after signing by a meeting’s in-person attendees)
 
 Microsoft Teams Attendance data obtained directly using the Microsoft Graph API or from Teams Attendance files downloaded manually using Teams.
 
-#### Build
+#### Runtime Requirements: Windows 10 or later and Microsoft Word (for PDF conversion)
+
+#### Build Requirements: CMake 3.15 or later and MSVC (Visual Studio 2019 or later)
 
 ```
 cmake -S "ISC2 Event Coordinator" -B "ISC2 Event Coordinator/build"
