@@ -30,5 +30,5 @@ cmake --build "ISC2 Event Coordinator/build" --config Release
 
 #### Usage
 
-Running EventCoordinator’s OAuth2 Setup Wizard: EventCoordinator --setup
-Running EventCoordinator to generate documents: EventCoordinator
+- **Running EventCoordinator’s OAuth2 Setup Wizard:** EventCoordinator --setup
+- **Running EventCoordinator to generate documents:** EventCoordinator
