@@ -6,12 +6,13 @@ Projects supporting ISC2 chapter event coordination.
 
 ### ISC2 Event Coordinator
 
-A Windows console application that downloads attendee registration data from Constant Contact and generates:
+A C++ Windows console application that uses Constant Contact attendee registration data and Microsoft Teams meeting attendance data to generate the following documents that support ISC2 Chapter Meetings:
 
 - **Registration Spreadsheet** — CSV derived from the Constant Contact Attendee report
-- **Registration List** — CSV of attendee names and email addresses
-- **Attendance Sheet** — populated DOCX and PDF for sign-in at the event
-- **Name Tags** — populated DOCX and PDF for printing attendee name tags
+- **Registration List** — CSV of attendee names and email addresses required by building security
+- **Attendance Sheet** — A PDF for printing
+- **Name Tags** — A PDF for printing on name tag paper
+- **ISC2 CPE Spreadsheet** — CSV of attendee information needed to submit CPE evidence to ISC2 for qualifying attendees
 
 #### Requirements
 
